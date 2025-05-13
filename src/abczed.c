@@ -28,21 +28,10 @@
 #include <sys/types.h>
 #include <time.h>
 #include <signal.h>  // For signal handling
-
-#ifndef _WIN32
+#include <termios.h> // For terminal I/O
 #include <sys/ioctl.h>
 #include <unistd.h>
-#endif
-
-/* Cross-platform compatibility */
-#ifdef _WIN32
-    #include <windows.h>
-    #include <io.h>
-    #include <pdcurses.h>
-#else
-    #include <ncurses.h>
-    #include <unistd.h>
-#endif
+#include <ncurses.h>
 
 /* Define key codes */
 #define CTRL_KEY(k) ((k) & 0x1f)
@@ -60,7 +49,8 @@ enum operation_type {
     OP_INSERT_CHAR,
     OP_DELETE_CHAR,
     OP_INSERT_LINE,
-    OP_DELETE_LINE
+    OP_DELETE_LINE,
+    OP_NEWLINE
 };
 
 /* Undo/Redo operation structure */
@@ -73,54 +63,41 @@ typedef struct operation {
     struct operation *next;
 } operation;
 
-/* Clipboard structure */
-typedef struct clipboard {
-    char **lines;         // Array of lines
-    int num_lines;        // Number of lines
-} clipboard;
-
 /* Data structure for a single line of text */
 typedef struct erow {
     int size;
     char *chars;
 } erow;
 
-/* Editor configuration */
-struct editor_config {
-    int cx, cy;           /* Cursor position */
-    int rowoff;           /* Row offset for scrolling */
-    int coloff;           /* Column offset for scrolling */
-    int screenrows;       /* Number of rows in terminal */
-    int screencols;       /* Number of columns in terminal */
-    int numrows;          /* Number of rows in file */
-    erow *row;            /* Rows of text */
-    char *filename;       /* Currently open filename */
-    char statusmsg[80];   /* Status message */
-    char commandbuf[256]; /* Command buffer */
-    int commandlen;       /* Length of command */
-    enum editor_mode mode; /* Current editor mode */
-    int dirty;            /* File modified but not saved? */
-    
-    /* Selection */
-    int sel_start_x, sel_start_y;  /* Selection start position */
-    int sel_end_x, sel_end_y;      /* Selection end position */
-    int selecting;                 /* Currently selecting? */
-    
-    /* Display options */
-    int show_line_numbers;         /* Show line numbers? */
-    
-    /* Clipboard */
-    clipboard clip;
-    
-    /* Undo/Redo */
-    operation *undo_stack;
-    operation *redo_stack;
-    
-    /* Font size */
-    int font_size;        /* Current font size (1-5) */
-};
+/* Editor configuration structure */
+typedef struct editor_config {
+    int cx, cy;                  /* Cursor x and y position */
+    int rowoff;                  /* Row offset */
+    int coloff;                  /* Column offset */
+    int screenrows;              /* Number of rows that we can show */
+    int screencols;             /* Number of columns that we can show */
+    int numrows;                /* Number of rows */
+    erow *row;                  /* Rows */
+    int dirty;                  /* File modified but not saved */
+    char *filename;             /* Currently open filename */
+    char statusmsg[80];         /* Status message */
+    time_t statusmsg_time;      /* When to clear status message */
+    enum editor_mode mode;       /* Current editor mode */
+    char **clipboard;           /* Array of lines in clipboard */
+    int clipboard_len;          /* Number of lines in clipboard */
+    int show_line_numbers;      /* Whether to show line numbers */
+    int font_size;              /* Font size for display */
+    char commandbuf[256];       /* Buffer for command input */
+    int commandlen;             /* Length of command in buffer */
+    int sel_start_x, sel_start_y; /* Selection start position */
+    int sel_end_x, sel_end_y;   /* Selection end position */
+    int selecting;              /* Currently selecting text */
+    operation *undo_stack;      /* Stack for undo operations */
+    operation *redo_stack;      /* Stack for redo operations */
+    struct termios orig_termios; /* Original terminal settings */
+} editor_config;
 
-struct editor_config E;
+editor_config E;
 
 /* Function prototype for cleanup to avoid implicit declaration warning */
 void editor_cleanup();
@@ -171,18 +148,13 @@ void init_editor() {
     E.show_line_numbers = 0;  /* Line numbers off by default */
     
     /* Initialize clipboard */
-    E.clip.lines = NULL;
-    E.clip.num_lines = 0;
+    E.clipboard = NULL;
+    E.clipboard_len = 0;
     
     /* Initialize font size (3 = normal) */
     E.font_size = 3;
     
     /* Set up terminal */
-    #ifdef _WIN32
-        /* PDCurses-specific setup */
-        PDC_set_title("ABC Vi Editor");
-    #endif
-    
     /* Enable color if supported */
     if (has_colors()) {
         start_color();
@@ -195,8 +167,14 @@ void init_editor() {
     /* Get screen size */
     getmaxyx(stdscr, E.screenrows, E.screencols);
     
-    /* Make room for status bar and command line */
-    E.screenrows -= 2;  /* Make room for status bar and command line */
+    /* Make sure we have enough rows for status bar and command line */
+    if (E.screenrows < 3) {
+        /* If terminal is too small, set minimum usable size */
+        E.screenrows = 1;
+    } else {
+        /* Reserve bottom 2 rows for status bar and command line */
+        E.screenrows -= 2;
+    }
     
     /* Ensure we have minimum screen dimensions */
     if (E.screenrows < 3) E.screenrows = 3;
@@ -365,13 +343,30 @@ void editor_insert_newline() {
     
     /* Handle case where there are no rows yet */
     if (E.numrows == 0) {
+        /* Create a new empty row */
         editor_insert_row(0, "", 0);
+        /* Add to undo stack */
+        push_operation(&E.undo_stack, OP_NEWLINE, 0, 0, '\n', NULL, 0);
         E.cy = 0;
         E.cx = 0;
         E.dirty++;
         return;
     }
     
+    /* Save the current row content for undo */
+    char *line_copy = NULL;
+    int line_size = 0;
+    
+    if (E.cx < E.row[E.cy].size) {
+        line_size = E.row[E.cy].size - E.cx;
+        line_copy = malloc(line_size + 1);
+        if (line_copy) {
+            memcpy(line_copy, &E.row[E.cy].chars[E.cx], line_size);
+            line_copy[line_size] = '\0';
+        }
+    }
+    
+    /* Insert the new row */
     if (E.cx == 0) {
         editor_insert_row(E.cy, "", 0);
     } else {
@@ -381,9 +376,19 @@ void editor_insert_newline() {
         row->size = E.cx;
         row->chars[row->size] = '\0';
     }
+    
+    /* Add to undo stack */
+    push_operation(&E.undo_stack, OP_NEWLINE, E.cx, E.cy, '\n', line_copy, line_size);
+    
+    /* Update cursor position */
     E.cy++;
     E.cx = 0;
     E.dirty++;
+    
+    /* Free the line copy if it was allocated */
+    if (line_copy) {
+        free(line_copy);
+    }
 }
 
 /* Delete character at cursor */
@@ -468,6 +473,47 @@ void editor_undo() {
             E.cx = 0;
             E.cy = op->cy;
             break;
+            
+        case OP_NEWLINE:
+            /* To undo a newline, we need to merge the current line with the previous one */
+            if (E.cy > 0) {
+                erow *prev_row = &E.row[E.cy - 1];
+                erow *curr_row = &E.row[E.cy];
+                
+                /* Save the original line content for redo */
+                char *line_copy = NULL;
+                if (op->line) {
+                    line_copy = strdup(op->line);
+                }
+                
+                /* Merge the current line into the previous one */
+                int new_size = prev_row->size + curr_row->size;
+                char *new_buf = realloc(prev_row->chars, new_size + 1);
+                if (new_buf) {
+                    prev_row->chars = new_buf;
+                    memcpy(prev_row->chars + prev_row->size, curr_row->chars, curr_row->size);
+                    prev_row->size = new_size;
+                    prev_row->chars[new_size] = '\0';
+                    
+                    /* Delete the current row */
+                    editor_del_row(E.cy);
+                    
+                    /* Update cursor position */
+                    E.cy--;
+                    E.cx = op->cx;
+                    E.dirty++;
+                    
+                    /* Update the operation for redo */
+                    free(op->line);
+                    op->line = line_copy;
+                    if (line_copy) {
+                        op->line_size = strlen(line_copy);
+                    } else {
+                        op->line_size = 0;
+                    }
+                }
+            }
+            break;
     }
     
     /* Add to redo stack */
@@ -513,6 +559,40 @@ void editor_redo() {
             editor_del_row(op->cy);
             E.cx = 0;
             E.cy = op->cy;
+            break;
+            
+        case OP_NEWLINE:
+            /* To redo a newline, we need to split the line at the cursor position */
+            if (E.cy < E.numrows) {
+                /* Save the current cursor position */
+                int save_cx = E.cx;
+                int save_cy = E.cy;
+                
+                /* Set cursor to the position where newline was inserted */
+                E.cx = op->cx;
+                E.cy = op->cy;
+                
+                /* Insert a newline at the cursor position */
+                editor_insert_newline();
+                
+                /* If there was text after the cursor, restore it to the new line */
+                if (op->line && op->line_size > 0) {
+                    erow *new_row = &E.row[E.cy];
+                    free(new_row->chars);
+                    new_row->chars = malloc(op->line_size + 1);
+                    if (new_row->chars) {
+                        memcpy(new_row->chars, op->line, op->line_size);
+                        new_row->size = op->line_size;
+                        new_row->chars[op->line_size] = '\0';
+                    } else {
+                        new_row->size = 0;
+                    }
+                }
+                
+                /* Restore cursor position */
+                E.cx = save_cx;
+                E.cy = save_cy;
+            }
             break;
     }
     
@@ -575,40 +655,34 @@ void editor_copy_selection() {
     editor_selection_normalize();
     
     /* Free previous clipboard content */
-    if (E.clip.lines) {
-        for (int i = 0; i < E.clip.num_lines; i++) {
-            if (E.clip.lines[i]) {
-                free(E.clip.lines[i]);
-                E.clip.lines[i] = NULL;
-            }
-        }
-        free(E.clip.lines);
-        E.clip.lines = NULL;
+    if (E.clipboard) {
+        free(E.clipboard);
+        E.clipboard = NULL;
     }
     
     /* Allocate clipboard for selected lines */
     int num_lines = E.sel_end_y - E.sel_start_y + 1;
     if (num_lines <= 0) {
-        E.clip.lines = NULL;
-        E.clip.num_lines = 0;
+        E.clipboard = NULL;
+        E.clipboard_len = 0;
         return;
     }
     
-    E.clip.lines = malloc(sizeof(char*) * num_lines);
-    if (!E.clip.lines) {
+    E.clipboard = malloc(num_lines * sizeof(char *));
+    if (!E.clipboard) {
         snprintf(E.statusmsg, sizeof(E.statusmsg), "Error: Out of memory");
-        E.clip.num_lines = 0;
+        E.clipboard_len = 0;
         return;
     }
-    E.clip.num_lines = num_lines;
+    E.clipboard_len = num_lines;
     
     if (num_lines == 1) {
         /* Single line selection */
         erow *row = &E.row[E.sel_start_y];
         int len = E.sel_end_x - E.sel_start_x;
-        E.clip.lines[0] = malloc(len + 1);
-        memcpy(E.clip.lines[0], &row->chars[E.sel_start_x], len);
-        E.clip.lines[0][len] = '\0';
+        E.clipboard[0] = malloc(len + 1);
+        memcpy(E.clipboard[0], &row->chars[E.sel_start_x], len);
+        E.clipboard[0][len] = '\0';
     } else {
         /* Multi-line selection */
         for (int i = 0; i < num_lines; i++) {
@@ -619,9 +693,9 @@ void editor_copy_selection() {
             int end = (i == num_lines - 1) ? E.sel_end_x : row->size;
             int len = end - start;
             
-            E.clip.lines[i] = malloc(len + 1);
-            memcpy(E.clip.lines[i], &row->chars[start], len);
-            E.clip.lines[i][len] = '\0';
+            E.clipboard[i] = malloc(len + 1);
+            memcpy(E.clipboard[i], &row->chars[start], len);
+            E.clipboard[i][len] = '\0';
         }
     }
     
@@ -630,31 +704,31 @@ void editor_copy_selection() {
 
 /* Paste clipboard at current position */
 void editor_paste() {
-    if (E.clip.num_lines == 0 || !E.clip.lines) {
+    if (E.clipboard == NULL || E.clipboard_len == 0) {
         snprintf(E.statusmsg, sizeof(E.statusmsg), "Nothing to paste");
         return;
     }
     
-    if (E.clip.num_lines == 1) {
+    if (E.clipboard_len == 1) {
         /* Single line paste */
-        char *line = E.clip.lines[0];
+        char *line = E.clipboard[0];
         for (int i = 0; line[i] != '\0'; i++) {
             editor_insert_char(line[i]);
         }
     } else {
         /* Multi-line paste */
-        for (int i = 0; i < E.clip.num_lines; i++) {
-            char *line = E.clip.lines[i];
+        for (int i = 0; i < E.clipboard_len; i++) {
+            char *line = E.clipboard[i];
             for (int j = 0; line[j] != '\0'; j++) {
                 editor_insert_char(line[j]);
             }
-            if (i < E.clip.num_lines - 1) {
+            if (i < E.clipboard_len - 1) {
                 editor_insert_newline();
             }
         }
     }
     
-    snprintf(E.statusmsg, sizeof(E.statusmsg), "Pasted %d lines", E.clip.num_lines);
+    snprintf(E.statusmsg, sizeof(E.statusmsg), "Pasted %d lines", E.clipboard_len);
 }
 
 /* Select all text */
@@ -1016,16 +1090,25 @@ void editor_draw_status_bar() {
 
 /* Draw the command line */
 void editor_draw_command_line() {
-    /* Clear the line first */
+    /* Make sure we have enough space for command line */
+    int max_y;
+    getmaxyx(stdscr, max_y, E.screencols);
+    
+    if (E.screenrows + 1 >= max_y) {
+        /* Not enough space for command line, just return */
+        return;
+    }
+    
+    /* Clear the command line */
     move(E.screenrows + 1, 0);
     clrtoeol();
     
     if (E.mode == MODE_COMMAND) {
         /* Show command with prompt */
         attron(COLOR_PAIR(1));
-        mvprintw(E.screenrows + 1, 0, "%s", E.commandbuf);
+        mvprintw(E.screenrows + 1, 0, ":%s", E.commandbuf);
         attroff(COLOR_PAIR(1));
-        move(E.screenrows + 1, E.commandlen);
+        move(E.screenrows + 1, E.commandlen + 1);  /* +1 for the colon */
     } else {
         /* Show status message with timeout */
         static time_t last_status_time = 0;
@@ -1068,9 +1151,14 @@ void editor_refresh_screen() {
     getmaxyx(stdscr, current_rows, current_cols);
     if (current_rows != E.screenrows + 2 || current_cols != E.screencols) {
         /* Update editor dimensions */
-        E.screenrows = current_rows - 2;
+        if (current_rows < 3) {
+            /* If terminal is too small, set minimum usable size */
+            E.screenrows = 1;
+        } else {
+            /* Reserve bottom 2 rows for status bar and command line */
+            E.screenrows = current_rows - 2;
+        }
         E.screencols = current_cols;
-        if (E.screenrows < 3) E.screenrows = 3;
         if (E.screencols < 20) E.screencols = 20;
     }
     
@@ -1080,18 +1168,14 @@ void editor_refresh_screen() {
     erase();
     
     /* Handle screen redraw */
-    #ifdef _WIN32
-        /* PDCurses-specific optimizations */
-        PDC_set_blink(FALSE);  /* Disable cursor blink during refresh */
-    #endif
-    
     editor_draw_rows();
     editor_draw_status_bar();
     editor_draw_command_line();
     
     /* Position cursor */
     if (E.mode == MODE_COMMAND) {
-        move(E.screenrows + 1, E.commandlen);
+        /* Position cursor in command line */
+        move(E.screenrows + 1, E.commandlen + 1);  /* +1 for the colon */
     } else {
         /* Calculate screen coordinates */
         int screen_y = saved_cy - E.rowoff;
@@ -1113,11 +1197,6 @@ void editor_refresh_screen() {
     
     /* Force screen update */
     refresh();
-    
-    #ifdef _WIN32
-        /* Re-enable cursor blink if needed */
-        PDC_set_blink(TRUE);
-    #endif
 }
 
 /* Move cursor */
@@ -1296,7 +1375,8 @@ void editor_process_keypress() {
                         if (next_c == 'c') {
                             E.mode = MODE_INSERT;
                             snprintf(E.statusmsg, sizeof(E.statusmsg), "-- INSERT --");
-                        } else if (next_c != ERR) {
+                        }
+                        if (next_c != ERR) {
                             ungetch(next_c);  /* Put back character for next read */
                         }
                     }
@@ -1357,6 +1437,11 @@ void editor_process_keypress() {
                 case '0':
                 case '$':
                     editor_move_cursor(c);
+                    break;
+                case '\r':  /* Enter key */
+                case KEY_ENTER: /* Some terminals send KEY_ENTER instead */
+                    E.mode = MODE_INSERT;
+                    snprintf(E.statusmsg, sizeof(E.statusmsg), "-- INSERT --");
                     break;
                 /* Font size changes using Ctrl+Shift++ and Ctrl+Shift+- */
                 case 43:  /* '+' key (may require different handling in some terminals) */
@@ -1521,7 +1606,7 @@ void editor_process_keypress() {
                             return;
                         }
                         start_row->chars = new_buf;
-                        memcpy(&start_row->chars[start_row->size], end_text, end_len);
+                        memcpy(start_row->chars + start_row->size, end_text, end_len);
                         start_row->size += end_len;
                         start_row->chars[start_row->size] = '\0';
                         
@@ -1577,16 +1662,16 @@ void editor_cleanup() {
     }
     
     /* Free clipboard */
-    if (E.clip.lines) {
-        for (int i = 0; i < E.clip.num_lines; i++) {
-            if (E.clip.lines[i]) {
-                free(E.clip.lines[i]);
-                E.clip.lines[i] = NULL; /* Prevent double-free issues */
+    if (E.clipboard) {
+        for (int i = 0; i < E.clipboard_len; i++) {
+            if (E.clipboard[i]) {
+                free(E.clipboard[i]);
+                E.clipboard[i] = NULL; /* Prevent double-free issues */
             }
         }
-        free(E.clip.lines);
-        E.clip.lines = NULL;
-        E.clip.num_lines = 0;
+        free(E.clipboard);
+        E.clipboard = NULL;
+        E.clipboard_len = 0;
     }
     
     /* Free undo/redo stacks */
@@ -1630,17 +1715,23 @@ int main(int argc, char *argv[]) {
     noecho();           /* Don't echo input */
     timeout(100);       /* Non-blocking input with 100ms timeout */
     
-    #ifdef _WIN32
-        /* Windows-specific terminal setup */
-        PDC_set_resize_limits(24, 80, 0, 0);  /* Minimum terminal size */
-        resize_term(25, 80);  /* Initial size */
-    #endif
+    /* Set terminal to raw mode */
+    if (tcgetattr(STDIN_FILENO, &E.orig_termios) == -1) die("tcgetattr");
+    atexit(editor_cleanup);
+    
+    /* Enable raw mode */
+    struct termios raw = E.orig_termios;
+    raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+    raw.c_oflag &= ~(OPOST);
+    raw.c_cflag |= (CS8);
+    raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 1;
+
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) die("tcsetattr");
     
     /* Initialize the editor */
     init_editor();
-    
-    /* Set up cleanup function to run on exit */
-    atexit(editor_cleanup);
     
     /* Process command line arguments */
     for (int i = 1; i < argc; i++) {
