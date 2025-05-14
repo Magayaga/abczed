@@ -19,6 +19,24 @@
  * Usage: ./abc_vi [filename]
  */
 
+/* Enable POSIX.1-2008 features on Linux */
+#ifdef __linux__
+#define _POSIX_C_SOURCE 200809L
+#endif
+
+/* Safe implementation of strdup if not available */
+#ifndef HAVE_STRDUP
+#include <string.h>
+#include <stdlib.h>
+
+char *strdup(const char *s) {
+    size_t len = strlen(s) + 1;
+    char *new = malloc(len);
+    if (new == NULL) return NULL;
+    return (char *)memcpy(new, s, len);
+}
+#endif
+
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -131,6 +149,9 @@ void free_operations_stack(operation *stack) {
 void init_editor() {
     /* Clear all memory first */
     memset(&E, 0, sizeof(E));
+    /* Initialize command buffer */
+    E.commandbuf[0] = '\0';
+    E.commandlen = 0;
     
     /* Initialize cursor and screen positions */
     E.cx = 0;
@@ -759,6 +780,9 @@ void editor_change_font_size(int delta) {
 void editor_open(char *filename) {
     free(E.filename);
     E.filename = strdup(filename);
+    if (!E.filename) {
+        die("strdup failed");
+    }
 
     FILE *fp = fopen(filename, "r");
     if (!fp) {
@@ -769,12 +793,57 @@ void editor_open(char *filename) {
     char *line = NULL;
     size_t linecap = 0;
     ssize_t linelen;
+    
+    /* Use our own implementation of getline if not available */
+    #if !defined(_POSIX_C_SOURCE) || _POSIX_C_SOURCE < 200809L
+    #define BUF_SIZE 1024
+    char buffer[BUF_SIZE];
+    while (fgets(buffer, sizeof(buffer), fp) != NULL) {
+        size_t len = strlen(buffer);
+        /* Remove trailing newline if present */
+        if (len > 0 && (buffer[len-1] == '\n' || buffer[len-1] == '\r')) {
+            buffer[--len] = '\0';
+            /* Handle CRLF if present */
+            if (len > 0 && buffer[len-1] == '\r') {
+                buffer[--len] = '\0';
+            }
+        }
+        /* Allocate or reallocate line buffer */
+        if (line == NULL) {
+            line = malloc(len + 1);
+            if (!line) die("malloc failed");
+            strcpy(line, buffer);
+        } else {
+            size_t old_len = strlen(line);
+            char *new_line = realloc(line, old_len + len + 1);
+            if (!new_line) {
+                free(line);
+                die("realloc failed");
+            }
+            line = new_line;
+            strcat(line, buffer);
+        }
+        linelen = strlen(line);
+        
+        /* Process the line */
+        while (linelen > 0 && (line[linelen - 1] == '\n' || line[linelen - 1] == '\r'))
+            linelen--;
+        editor_insert_row(E.numrows, line, linelen);
+        
+        /* Reset line for next iteration */
+        free(line);
+        line = NULL;
+    }
+    #else
+    /* Use system's getline */
     while ((linelen = getline(&line, &linecap, fp)) != -1) {
         while (linelen > 0 && (line[linelen - 1] == '\n' || line[linelen - 1] == '\r'))
             linelen--;
         editor_insert_row(E.numrows, line, linelen);
     }
     free(line);
+    #endif
+    
     fclose(fp);
     E.dirty = 0;
     
@@ -810,9 +879,80 @@ int editor_save() {
     return 0;
 }
 
+/* Process command with optional double colon prefix.
+ * Normalizes the command to start with exactly one colon.
+ * Handles cases like ':', '::', '::cmd', 'cmd' etc.
+ * Returns 1 if the command is valid, 0 if it should be ignored.
+ */
+int process_command_prefix(char *cmd) {
+    if (!cmd || !*cmd) return 0;  /* NULL or empty command */
+    
+    size_t len = strlen(cmd);
+    if (len >= 256) return 0;  /* Command too long */
+    
+    /* Skip leading whitespace */
+    char *p = cmd;
+    while (*p == ' ' || *p == '\t') p++;
+    if (p > cmd) {
+        memmove(cmd, p, len - (p - cmd) + 1);
+        len = strlen(cmd);
+    }
+    
+    /* Find first non-colon character */
+    size_t first_non_colon = 0;
+    while (first_non_colon < len && cmd[first_non_colon] == ':') {
+        first_non_colon++;
+    }
+    
+    /* Handle empty command or just colons */
+    if (first_non_colon >= len) {
+        cmd[0] = ':';
+        cmd[1] = '\0';
+        return 0;  /* Don't process empty commands */
+    }
+    
+    /* If command doesn't start with a colon, add one */
+    if (first_non_colon == 0) {
+        if (len + 1 >= sizeof(E.commandbuf)) return 0;  /* Check buffer space */
+        memmove(cmd + 1, cmd, len + 1);  /* +1 for null terminator */
+        cmd[0] = ':';
+        len++;
+    }
+    /* If command starts with multiple colons, collapse them to one */
+    else if (first_non_colon > 1) {
+        memmove(cmd + 1, cmd + first_non_colon, len - first_non_colon + 1);
+        cmd[0] = ':';
+        len -= (first_non_colon - 1);
+    }
+    
+    /* Trim any whitespace after the colon */
+    p = cmd + 1;
+    while (*p == ' ' || *p == '\t') p++;
+    if (p > cmd + 1) {
+        memmove(cmd + 1, p, len - (p - cmd) + 1);
+    }
+    
+    /* Ensure the command is not just a colon */
+    return (strlen(cmd) > 1);
+}
+
 /* Process command */
 int editor_process_command() {
-    E.commandbuf[E.commandlen] = '\0';
+    /* Ensure command is null-terminated */
+    size_t cmd_buf_size = sizeof(E.commandbuf);
+    if (E.commandlen >= 0 && (size_t)E.commandlen >= cmd_buf_size) {
+        E.commandbuf[cmd_buf_size - 1] = '\0';
+        E.commandlen = (int)(cmd_buf_size - 1);
+    } else {
+        E.commandbuf[E.commandlen] = '\0';
+    }
+    
+    /* Process command prefix (handle double colons and whitespace) */
+    if (!process_command_prefix(E.commandbuf)) {
+        /* Empty or invalid command */
+        return 0;
+    }
+    E.commandlen = strlen(E.commandbuf);
     
     /* Command history feature */
     static char cmd_history[10][256];  /* Store last 10 commands */
@@ -830,8 +970,17 @@ int editor_process_command() {
     int force_quit = 0;
     int preserve_position = 1;  /* By default, preserve cursor position */
     
+    /* Trim any trailing whitespace from command */
+    char *cmd = E.commandbuf;
+    while (*cmd == ' ' || *cmd == '\t') cmd++;  /* Skip leading whitespace */
+    char *end = cmd + strlen(cmd) - 1;
+    while (end > cmd && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')) {
+        *end-- = '\0';
+    }
+    
     /* Check for vim-like commands */
-    if (strcmp(E.commandbuf, ":q") == 0) {
+    if (strcmp(cmd, ":q") == 0 || strcmp(cmd, ":quit") == 0 ||
+        strcmp(cmd, "::q") == 0 || strcmp(cmd, "::quit") == 0) {
         /* Quit if not dirty */
         if (E.dirty) {
             snprintf(E.statusmsg, sizeof(E.statusmsg),
@@ -839,21 +988,23 @@ int editor_process_command() {
         } else {
             should_quit = 1;
         }
-    } else if (strcmp(E.commandbuf, ":q!") == 0) {
+    } else if (strcmp(cmd, ":q!") == 0 || strcmp(cmd, ":quit!") == 0 ||
+               strcmp(cmd, "::q!") == 0 || strcmp(cmd, "::quit!") == 0) {
         /* Force quit without saving */
         should_quit = 1;
         force_quit = 1;
-    } else if (strcmp(E.commandbuf, ":w") == 0) {
+    } else if (strcmp(cmd, ":w") == 0 || strcmp(cmd, "::w") == 0) {
         /* Save file */
         editor_save();
-    } else if (strcmp(E.commandbuf, ":wq") == 0) {
+    } else if (strcmp(cmd, ":wq") == 0 || strcmp(cmd, "::wq") == 0 ||
+               strcmp(cmd, ":sq") == 0 || strcmp(cmd, "::sq") == 0) {
         /* Save and quit */
         if (editor_save() == 0) {
             should_quit = 1;
         }
-    } else if (strncmp(E.commandbuf, ":e ", 3) == 0) {
+    } else if (strncmp(cmd, ":e ", 3) == 0 || strncmp(cmd, "::e ", 4) == 0) {
         /* Edit file - open a new file */
-        char *filename = E.commandbuf + 3;
+        char *filename = cmd + (cmd[1] == ':' ? 4 : 3);
         if (E.dirty) {
             snprintf(E.statusmsg, sizeof(E.statusmsg),
                     "No write since last change (add ! to override)");
@@ -866,9 +1017,9 @@ int editor_process_command() {
             snprintf(E.statusmsg, sizeof(E.statusmsg), "Opened %s", filename);
             preserve_position = 0;  /* Don't preserve position when opening new file */
         }
-    } else if (strncmp(E.commandbuf, ":e! ", 4) == 0) {
+    } else if (strncmp(cmd, ":e! ", 4) == 0 || strncmp(cmd, "::e! ", 5) == 0) {
         /* Force edit file - open a new file without saving */
-        char *filename = E.commandbuf + 4;
+        char *filename = cmd + (cmd[1] == ':' ? 5 : 4);
         /* Clear editor content */
         for (int i = E.numrows - 1; i >= 0; i--) {
             editor_del_row(i);
@@ -879,7 +1030,7 @@ int editor_process_command() {
     } else {
         /* Limit command display to avoid buffer overflow */
         char cmd_display[60];
-        strncpy(cmd_display, E.commandbuf, sizeof(cmd_display) - 1);
+        strncpy(cmd_display, cmd, sizeof(cmd_display) - 1);
         cmd_display[sizeof(cmd_display) - 1] = '\0';
         
         snprintf(E.statusmsg, sizeof(E.statusmsg),
@@ -1090,25 +1241,63 @@ void editor_draw_status_bar() {
 
 /* Draw the command line */
 void editor_draw_command_line() {
-    /* Make sure we have enough space for command line */
-    int max_y;
-    getmaxyx(stdscr, max_y, E.screencols);
+    /* Get terminal dimensions */
+    int max_y, max_x;
+    getmaxyx(stdscr, max_y, max_x);
     
+    /* Check if we have space for command line */
     if (E.screenrows + 1 >= max_y) {
-        /* Not enough space for command line, just return */
-        return;
+        return;  /* Not enough space */
     }
     
-    /* Clear the command line */
+    /* Clear the command line area */
     move(E.screenrows + 1, 0);
     clrtoeol();
     
     if (E.mode == MODE_COMMAND) {
-        /* Show command with prompt */
-        attron(COLOR_PAIR(1));
-        mvprintw(E.screenrows + 1, 0, ":%s", E.commandbuf);
-        attroff(COLOR_PAIR(1));
-        move(E.screenrows + 1, E.commandlen + 1);  /* +1 for the colon */
+        /* Ensure command buffer is properly terminated */
+        if (E.commandlen < 0) E.commandlen = 0;
+        if (E.commandlen >= (int)sizeof(E.commandbuf)) {
+            E.commandlen = (int)sizeof(E.commandbuf) - 1;
+        }
+        E.commandbuf[E.commandlen] = '\0';  /* Always null-terminate */
+        
+        /* Draw command prompt */
+        attron(COLOR_PAIR(1) | A_BOLD);
+        mvaddch(E.screenrows + 1, 0, ':');
+        
+        /* Calculate available space for command */
+        int available_width = max_x - 1;  /* -1 for the colon */
+        if (available_width < 1) available_width = 1;
+        
+        /* Print command content - only printable ASCII characters */
+        for (int i = 0; i < available_width && i < E.commandlen; i++) {
+            unsigned char c = (unsigned char)E.commandbuf[i];
+            /* Only display printable ASCII characters (32-126) */
+            if (c >= 32 && c <= 126) {
+                /* Special handling for colon - only show one at the beginning */
+                if (c == ':' && i == 0) {
+                    /* Already displayed by the prompt */
+                    continue;
+                }
+                mvaddch(E.screenrows + 1, i + 1, c);
+            } else {
+                /* Skip non-printable characters in display */
+                mvaddch(E.screenrows + 1, i + 1, ' ');
+            }
+        }
+        
+        /* Clear any remaining space in the command line */
+        for (int i = E.commandlen + 1; i <= available_width; i++) {
+            mvaddch(E.screenrows + 1, i, ' ');
+        }
+        
+        /* Position cursor */
+        int cursor_pos = E.commandlen + 1;
+        if (cursor_pos > available_width) cursor_pos = available_width;
+        move(E.screenrows + 1, cursor_pos);
+        
+        attroff(COLOR_PAIR(1) | A_BOLD);
     } else {
         /* Show status message with timeout */
         static time_t last_status_time = 0;
@@ -1331,40 +1520,40 @@ void editor_process_keypress() {
     
     /* Handle ESC key to exit modes */
     if (c == 27) {  /* ESC key */
-        /* Check if this is a standalone ESC key or part of a sequence */
-        timeout(0);  /* Don't block on next read */
-        int next = getch();
-        timeout(100); /* Reset timeout */
-        
-        if (next == ERR) {  /* No more input - standalone ESC */
-            /* Process ESC key */
-            if (E.mode != MODE_NORMAL) {
-                /* Save previous mode to handle cursor position correctly */
-                int prev_mode = E.mode;
-                
-                E.mode = MODE_NORMAL;
-                /* Move cursor back only if coming from INSERT mode */
-                if (prev_mode == MODE_INSERT && E.cx > 0 && E.numrows > 0)
-                    E.cx--;  /* Move cursor back by one */
-                
-                E.commandbuf[0] = '\0';
-                E.commandlen = 0;
-                editor_selection_clear();
-                snprintf(E.statusmsg, sizeof(E.statusmsg), "-- NORMAL --");
-            }
-            return;
+        /* For better responsiveness, immediately process ESC without checking for sequence */
+        if (E.mode != MODE_NORMAL) {
+            /* Save previous mode to handle cursor position correctly */
+            int prev_mode = E.mode;
+            
+            E.mode = MODE_NORMAL;
+            /* Move cursor back only if coming from INSERT mode */
+            if (prev_mode == MODE_INSERT && E.cx > 0 && E.numrows > 0)
+                E.cx--;  /* Move cursor back by one */
+            
+            E.commandbuf[0] = '\0';
+            E.commandlen = 0;
+            editor_selection_clear();
+            snprintf(E.statusmsg, sizeof(E.statusmsg), "-- NORMAL --");
+            
+            /* Clear any potential escape sequence that might be in the input buffer */
+            nodelay(stdscr, TRUE);
+            while (getch() != ERR);  /* Flush input buffer */
+            nodelay(stdscr, FALSE);
         } else {
-            /* This is part of an escape sequence, put back the character */
-            ungetch(next);
+            /* If already in NORMAL mode, just clear any escape sequence */
+            nodelay(stdscr, TRUE);
+            while (getch() != ERR);  /* Flush input buffer */
+            nodelay(stdscr, FALSE);
         }
+        return;
     }
-    
     /* Handle key based on current mode */
     switch (E.mode) {
         case MODE_NORMAL:
             /* Show NORMAL mode status */
             snprintf(E.statusmsg, sizeof(E.statusmsg), "-- NORMAL --");
             switch (c) {
+/* ... */
                 case 'c':  /* First 'c' of "cc" for insert mode (ABC Vi style) */
                     {
                         /* Check for second 'c' */
@@ -1382,6 +1571,7 @@ void editor_process_keypress() {
                     }
                     break;
                 case ':':
+                    /* Enter command mode and reset command buffer */
                     E.mode = MODE_COMMAND;
                     E.commandbuf[0] = ':';
                     E.commandlen = 1;
@@ -1521,36 +1711,60 @@ void editor_process_keypress() {
             
         case MODE_COMMAND:
             switch (c) {
+                case ':': /* Enter command mode */
+                    E.mode = MODE_COMMAND;
+                    memset(E.commandbuf, 0, sizeof(E.commandbuf));  /* Clear entire buffer */
+                    E.commandbuf[0] = '\0';  /* Ensure null termination */
+                    E.commandlen = 0;
+                    break;
                 case 27:  /* ESC key */
                     E.mode = MODE_NORMAL;
-                    E.commandbuf[0] = '\0';
+                    memset(E.commandbuf, 0, sizeof(E.commandbuf));  /* Clear entire buffer */
+                    E.commandbuf[0] = '\0';  /* Ensure null termination */
                     E.commandlen = 0;
                     E.statusmsg[0] = '\0';
                     break;
                 case '\r':  /* Enter key */
                 case KEY_ENTER: /* Some terminals send KEY_ENTER instead */
-                    E.commandbuf[E.commandlen] = '\0';
-                    editor_process_command();
-                    /* If command did not quit, return to normal mode */
+                    if (E.commandlen > 0) {
+                        /* Process command (includes validation and prefix handling) */
+                        int should_quit = editor_process_command();
+                        if (should_quit) return;  /* Quit if command requested */
+                    }
+                    /* Always return to normal mode after command */
                     E.mode = MODE_NORMAL;
-                    E.commandbuf[0] = '\0';
+                    memset(E.commandbuf, 0, sizeof(E.commandbuf));  /* Clear entire buffer */
+                    E.commandbuf[0] = '\0';  /* Ensure null termination */
                     E.commandlen = 0;
-                    /* Command processing is handled in editor_process_command() */
                     break;
                 case KEY_BACKSPACE:
                 case 127:  /* Also backspace on some terminals */
-                    if (E.commandlen > 1) {
+                    if (E.commandlen > 0) {
                         E.commandlen--;
                         E.commandbuf[E.commandlen] = '\0';
-                    } else {
-                        E.mode = MODE_NORMAL;
-                        E.commandbuf[0] = '\0';
-                        E.commandlen = 0;
                     }
                     break;
                 default:
-                    if (!iscntrl(c) && (size_t)E.commandlen < sizeof(E.commandbuf) - 1) {
-                        E.commandbuf[E.commandlen++] = c;
+                    /* Add character to command buffer if printable ASCII (32-126) */
+                    if (c >= 32 && c <= 126 && E.commandlen < (int)sizeof(E.commandbuf) - 1) {
+                        /* Special handling for colon character */
+                        if (c == ':') {
+                            /* If this is the first character, add it normally */
+                            if (E.commandlen == 0) {
+                                E.commandbuf[E.commandlen++] = c;
+                            }
+                            /* Otherwise, don't add multiple colons at the start */
+                            else if (E.commandbuf[0] == ':' && E.commandlen == 1) {
+                                /* Skip adding another colon */
+                            }
+                            /* For other positions, add normally */
+                            else {
+                                E.commandbuf[E.commandlen++] = c;
+                            }
+                        } else {
+                            /* Normal character - add it */
+                            E.commandbuf[E.commandlen++] = c;
+                        }
                         E.commandbuf[E.commandlen] = '\0';
                     }
                     break;
